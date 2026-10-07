@@ -1,0 +1,982 @@
+@host = http://localhost:4004
+@q    = {{host}}/odata/v4/quotation
+@pr   = {{host}}/odata/v4/pricing
+
+# RUN: npx cds watch  (restart it before every full run to reset the data)
+# Send the blocks top to bottom. Blocks with "# @name" save the response ID for later blocks.
+
+#####################################################################
+# 0. SECURITY
+#####################################################################
+
+### 0.1 No login
+# EXPECT: 401
+GET {{q}}/Quotations
+
+### 0.2 Job user cannot read quotations
+# EXPECT: 403
+GET {{q}}/Quotations
+Authorization: Basic scheduler:secret
+
+### 0.3 Auditor can read, but not create
+# EXPECT: 200
+GET {{q}}/Quotations
+Authorization: Basic auditor:secret
+
+### 0.4 Auditor cannot create
+# EXPECT: 403
+POST {{q}}/Quotations
+Authorization: Basic auditor:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR" }
+
+#####################################################################
+# 1. PRICING CONFIGURATION
+#####################################################################
+
+### 1.1 List pricing rules
+# EXPECT: 200, 20 rules on a fresh start
+GET {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+
+### 1.2 Discount above 100
+# EXPECT: 400 "maxDiscountPct must be between 0 and 100"
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "X1", "basePrice": 100, "marginPct": 10,
+  "maxDiscountPct": 150, "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+### 1.3 Valid-To before Valid-From
+# EXPECT: 400 "Valid To cannot be earlier than Valid From"
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "X1", "basePrice": 100,
+  "validFrom": "2026-12-31", "validTo": "2026-10-07" }
+
+### 1.4 L2 limit lower than L1 limit
+# EXPECT: 400 "Approval Level 2 limit cannot be lower than Level 1 limit"
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "X1", "basePrice": 100,
+  "approvalL1Limit": 10, "approvalL2Limit": 5,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+### 1.5 Neither material nor material group
+# EXPECT: 400 "Enter a Material or a Material Group"
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "basePrice": 100,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+### 1.6 Base price zero
+# EXPECT: 400 "Base price must be greater than 0"
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "X1", "basePrice": 0,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+### 1.7 Sales Executive cannot create pricing rules
+# EXPECT: 403
+POST {{pr}}/PricingConfigs
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "X1", "basePrice": 100,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+### 1.8 Create a valid rule (starts Inactive)
+# EXPECT: 201, status "Inactive"
+# @name createRule
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Part", "material": "CAT-NEW-1", "basePrice": 500, "marginPct": 10,
+  "maxDiscountPct": 5, "minPriceThreshold": 520, "approvalL1Limit": 5, "approvalL2Limit": 10,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR" }
+
+###
+@ruleId = {{createRule.response.body.ID}}
+
+### 1.9 Activate it
+# EXPECT: 200, status "Active"
+POST {{pr}}/PricingConfigs({{ruleId}})/PricingService.activate
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{}
+
+### 1.10 Change the base price (writes an audit entry)
+# EXPECT: 200
+PATCH {{pr}}/PricingConfigs({{ruleId}})
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "basePrice": 550 }
+
+### 1.11 Deactivate it
+# EXPECT: 200, status "Inactive"
+POST {{pr}}/PricingConfigs({{ruleId}})/PricingService.deactivate
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{}
+
+### 1.12 Overlapping rule for CAT-320-EXC (it already has an active rule)
+# EXPECT: 201, status "Inactive"
+# @name createDup
+POST {{pr}}/PricingConfigs
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{ "category": "Equipment", "material": "CAT-320-EXC", "basePrice": 9000, "marginPct": 5,
+  "validFrom": "2026-10-07", "validTo": "2026-12-31" }
+
+###
+@dupId = {{createDup.response.body.ID}}
+
+### 1.13 Activate the duplicate
+# EXPECT: 409 "An active pricing rule already exists..."
+POST {{pr}}/PricingConfigs({{dupId}})/PricingService.activate
+Authorization: Basic pricing:secret
+Content-Type: application/json
+
+{}
+
+#####################################################################
+# 2. MASTER DATA
+#####################################################################
+
+### 2.1 Customer value help
+# EXPECT: 200, 1 customer (Coastal Mining Pvt Ltd)
+GET {{host}}/odata/v4/masterdata/BusinessPartners?$filter=contains(name,'Coastal')
+Authorization: Basic sales:secret
+
+### 2.2 Material value help
+# EXPECT: 200, 20 materials
+GET {{host}}/odata/v4/masterdata/Materials
+Authorization: Basic sales:secret
+
+#####################################################################
+# 3. FLOW A: within threshold -> auto-approved -> issue -> sales order
+#####################################################################
+
+### A1 Create quotation (10 x oil filter, 2% discount)
+# EXPECT: 201
+# @name createA
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000002", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 10, "discountPct": 2 } ] }
+
+###
+@qA = {{createA.response.body.ID}}
+
+### A2 Read it
+# EXPECT: status "Draft"; quotationNo like Q-2026-000NN; netValue 28175;
+#         taxValue 5071.5; totalValue 33246.5; item InStock; netPrice 2817.5
+GET {{q}}/Quotations({{qA}})?$expand=items
+Authorization: Basic sales:secret
+
+### A3 Submit
+# EXPECT: status "Approved" (auto-approved)
+POST {{q}}/Quotations({{qA}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### A4 Approval history
+# EXPECT: 1 entry: action "AutoApproved", approver "system"
+GET {{q}}/ApprovalHistory?$filter=quotation_ID eq {{qA}}
+Authorization: Basic sales:secret
+
+### A5 Issue
+# EXPECT: status "Issued"
+POST {{q}}/Quotations({{qA}})/QuotationService.issue
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### A6 Create sales order
+# EXPECT: status "Converted"; s4SalesOrderNo filled
+POST {{q}}/Quotations({{qA}})/QuotationService.createSalesOrder
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### A7 Create sales order again
+# EXPECT: 409
+POST {{q}}/Quotations({{qA}})/QuotationService.createSalesOrder
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### A8 Edit a converted quotation
+# EXPECT: 409 "Quotation cannot be changed when status is Converted"
+PATCH {{q}}/Quotations({{qA}})
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "remarks": "late change" }
+
+### A9 Audit log
+# EXPECT: 200, status changes Draft->Approved->Issued->Converted
+GET {{q}}/AuditLog?$filter=entityKey eq '{{qA}}'
+Authorization: Basic auditor:secret
+
+### A10 Sales Executive cannot read the audit log
+# EXPECT: 403
+GET {{q}}/AuditLog
+Authorization: Basic sales:secret
+
+#####################################################################
+# 4. FLOW B: threshold breached -> Level 1 approval
+#####################################################################
+
+### B1 Create (10% discount pushes net price below the minimum)
+# @name createB
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000002", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 4, "discountPct": 10 } ] }
+
+###
+@qB = {{createB.response.body.ID}}
+
+### B2 Read
+# EXPECT: thresholdBreached true, deviationPct 0.48, netPrice 2587.5; approvalLevelRequired 1
+GET {{q}}/Quotations({{qB}})?$expand=items
+Authorization: Basic sales:secret
+
+### B3 Discount above the maximum (11%)
+# EXPECT: 400 "discount 11% exceeds the maximum allowed 10%"
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000002", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 1, "discountPct": 11 } ] }
+
+### B4 Submit
+# EXPECT: status "PendingL1"
+POST {{q}}/Quotations({{qB}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### B5 Edit while pending approval
+# EXPECT: 409 "Quotation cannot be changed when status is PendingL1"
+PATCH {{q}}/Quotations({{qB}})
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "remarks": "change" }
+
+### B6 Sales Executive tries to approve
+# EXPECT: 403
+POST {{q}}/Quotations({{qB}})/QuotationService.approve
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "comments": "self approve" }
+
+### B7 Manager's worklist
+# EXPECT: 200, contains this quotation and the seeded PendingL1 ones
+GET {{q}}/myApprovals()
+Authorization: Basic manager:secret
+
+### B8 Reject without a comment
+# EXPECT: 400 "A comment is mandatory for reject / return"
+POST {{q}}/Quotations({{qB}})/QuotationService.reject
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "" }
+
+### B9 Regional Head tries a Level 1 decision
+# EXPECT: 403 "Only SalesManager can act ..."
+POST {{q}}/Quotations({{qB}})/QuotationService.approve
+Authorization: Basic head:secret
+Content-Type: application/json
+
+{ "comments": "wrong level" }
+
+### B10 Manager approves
+# EXPECT: status "Approved"
+POST {{q}}/Quotations({{qB}})/QuotationService.approve
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "OK for this customer" }
+
+#####################################################################
+# 5. FLOW C: Level 1 then Level 2 approval
+#####################################################################
+
+### C1 Create (fuel filter, 10% discount -> deviation 5.71%)
+# @name createC
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-9X3263", "quantity": 1, "discountPct": 10 } ] }
+
+###
+@qC = {{createC.response.body.ID}}
+
+### C2 Read
+# EXPECT: approvalLevelRequired 2; deviationPct 5.71
+GET {{q}}/Quotations({{qC}})?$expand=items
+Authorization: Basic sales:secret
+
+### C3 Submit
+# EXPECT: status "PendingL1"
+POST {{q}}/Quotations({{qC}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### C4 Manager approves (Level 1)
+# EXPECT: status "PendingL2"
+POST {{q}}/Quotations({{qC}})/QuotationService.approve
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "L1 ok" }
+
+### C5 Manager tries again
+# EXPECT: 403 "Only RegionalHead can act ..."
+POST {{q}}/Quotations({{qC}})/QuotationService.approve
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "again" }
+
+### C6 Regional Head's worklist
+# EXPECT: 200, contains this quotation and the seeded PendingL2 one
+GET {{q}}/myApprovals()
+Authorization: Basic head:secret
+
+### C7 Regional Head approves (Level 2)
+# EXPECT: status "Approved"
+POST {{q}}/Quotations({{qC}})/QuotationService.approve
+Authorization: Basic head:secret
+Content-Type: application/json
+
+{ "comments": "L2 ok" }
+
+### C8 Approval history
+# EXPECT: 3 entries: Submitted (0), Approved (1), Approved (2)
+GET {{q}}/ApprovalHistory?$filter=quotation_ID eq {{qC}}
+Authorization: Basic sales:secret
+
+#####################################################################
+# 6. FLOW D: reject, and return -> correct -> resubmit
+#####################################################################
+
+### D1 Create
+# @name createD
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000002", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 4, "discountPct": 10 } ] }
+
+###
+@qD = {{createD.response.body.ID}}
+
+### D2 Submit
+# EXPECT: status "PendingL1"
+POST {{q}}/Quotations({{qD}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### D3 Manager returns it with a comment
+# EXPECT: status "Returned"
+POST {{q}}/Quotations({{qD}})/QuotationService.returnForRevision
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "Reduce the discount" }
+
+### D4 Read to get the item ID
+# @name readD
+GET {{q}}/Quotations({{qD}})?$expand=items
+Authorization: Basic sales:secret
+
+###
+@itemD = {{readD.response.body.items[0].ID}}
+
+### D5 SE reduces the discount to 2%
+# EXPECT: 200
+PATCH {{q}}/QuotationItems({{itemD}})
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "discountPct": 2 }
+
+### D6 Check the recalculated price
+# EXPECT: netPrice 2817.5, thresholdBreached false, approvalLevelRequired 0
+GET {{q}}/Quotations({{qD}})?$expand=items
+Authorization: Basic sales:secret
+
+### D7 Resubmit
+# EXPECT: status "Approved" (auto)
+POST {{q}}/Quotations({{qD}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### D8 Create another quotation to test Reject
+# @name createD2
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000002", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 4, "discountPct": 10 } ] }
+
+###
+@qD2 = {{createD2.response.body.ID}}
+
+### D9 Submit it
+# EXPECT: status "PendingL1"
+POST {{q}}/Quotations({{qD2}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### D10 Manager rejects with a comment
+# EXPECT: status "Rejected"
+POST {{q}}/Quotations({{qD2}})/QuotationService.reject
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "Discount not justified" }
+
+### D11 Edit a rejected quotation
+# EXPECT: 409 "Quotation cannot be changed when status is Rejected"
+PATCH {{q}}/Quotations({{qD2}})
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "remarks": "x" }
+
+#####################################################################
+# 7. FLOW E: stock missing -> PR -> PO -> supplier date -> GR
+#####################################################################
+
+### E1 Create (hydraulic hose has no stock)
+# @name createE
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000003", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-3E2247", "quantity": 4, "discountPct": 5 } ] }
+
+###
+@qE = {{createE.response.body.ID}}
+
+### E2 Read to get the item ID
+# EXPECT: stockStatus "NotInStock", availableQty 0, procurementStatus "None"
+# @name readE
+GET {{q}}/Quotations({{qE}})?$expand=items
+Authorization: Basic sales:secret
+
+###
+@itemE = {{readE.response.body.items[0].ID}}
+
+### E3 Submit without stock
+# EXPECT: 409 "Stock not available for: CAT-3E2247 ..."
+POST {{q}}/Quotations({{qE}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### E4 Supply chain updates before a PR exists
+# EXPECT: 409 "Create the purchase requisition first"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "PRReleased" }
+
+### E5 Create purchase requisition
+# EXPECT: 200, procurementStatus "PRCreated", prNumber like PR12345678
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.createPurchaseRequisition
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### E6 Quotation status
+# EXPECT: status "AwaitingStock"
+GET {{q}}/Quotations({{qE}})
+Authorization: Basic sales:secret
+
+### E7 Create PR again
+# EXPECT: 409 "Procurement already started (PRCreated)"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.createPurchaseRequisition
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### E8 Sales Executive tries to update procurement
+# EXPECT: 403
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "status": "PRReleased" }
+
+### E9 PR released
+# EXPECT: procurementStatus "PRReleased"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "PRReleased" }
+
+### E10 PO created
+# EXPECT: procurementStatus "POCreated", poNumber 4500001234
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "POCreated", "refDoc": "4500001234" }
+
+### E11 Supplier confirms without a date
+# EXPECT: 400 "Supplier confirmed delivery date is mandatory"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "SupplierConfirmed" }
+
+### E12 Supplier confirms with a date
+# EXPECT: procurementStatus "SupplierConfirmed", expectedDate 2026-10-20
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "SupplierConfirmed", "expectedDate": "2026-10-20" }
+
+### E13 Move backwards
+# EXPECT: 409 "Cannot move from SupplierConfirmed to POCreated"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "POCreated" }
+
+### E14 Shipped
+# EXPECT: procurementStatus "Shipped"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "Shipped" }
+
+### E15 Goods receipt
+# EXPECT: procurementStatus "GRPosted", stockStatus "InStock"
+POST {{q}}/QuotationItems({{itemE}})/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "GRPosted" }
+
+### E16 Quotation status after GR
+# EXPECT: status "Draft" (back from AwaitingStock)
+GET {{q}}/Quotations({{qE}})?$expand=items
+Authorization: Basic sales:secret
+
+### E17 Procurement history
+# EXPECT: 6 events: PRCreated, PRReleased, POCreated, SupplierConfirmed, Shipped, GRPosted
+GET {{q}}/ProcurementEvents?$filter=item_ID eq {{itemE}}
+Authorization: Basic sales:secret
+
+### E18 Submit now
+# EXPECT: status "Approved"
+POST {{q}}/Quotations({{qE}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### E19 PR for an item that is in stock (new quotation, then try a PR)
+# @name createE2
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000003", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 1 } ] }
+
+###
+@qE2 = {{createE2.response.body.ID}}
+
+### E20 Read to get the item ID
+# @name readE2
+GET {{q}}/Quotations({{qE2}})?$expand=items
+Authorization: Basic sales:secret
+
+###
+@itemE2 = {{readE2.response.body.items[0].ID}}
+
+### E21 PR when stock is available
+# EXPECT: 409 "Stock is available, no purchase requisition needed"
+POST {{q}}/QuotationItems({{itemE2}})/QuotationService.createPurchaseRequisition
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+#####################################################################
+# 8. CANCEL, VALIDATION AND EDIT RULES
+#####################################################################
+
+### F1 Create a draft
+# @name createF
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000004", "validFrom": "2026-10-07", "validTo": "2026-12-31",
+  "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 1 } ] }
+
+###
+@qF = {{createF.response.body.ID}}
+
+### F2 Add another item
+# EXPECT: 201
+POST {{q}}/QuotationItems
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "quotation_ID": "{{qF}}", "material": "CAT-9X3263", "quantity": 2 }
+
+### F3 Totals after adding the item
+# EXPECT: 2 items; netValue 5075 (2875 + 2200); itemNo 10 and 20
+GET {{q}}/Quotations({{qF}})?$expand=items
+Authorization: Basic sales:secret
+
+### F4 Recalculate
+# EXPECT: 200, same totals
+POST {{q}}/Quotations({{qF}})/QuotationService.recalculate
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### F5 Cancel
+# EXPECT: status "Cancelled"
+POST {{q}}/Quotations({{qF}})/QuotationService.cancel
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### F6 Edit after cancel
+# EXPECT: 409
+PATCH {{q}}/Quotations({{qF}})
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "remarks": "x" }
+
+### F7 Unknown customer
+# EXPECT: 400 "Customer 9999999 not found"
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "9999999", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR" }
+
+### F8 Valid-To before Valid-From
+# EXPECT: 400 "Valid To cannot be earlier than Valid From"
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-12-31", "validTo": "2026-10-07", "currency_code": "INR" }
+
+### F9 Material with no pricing rule
+# EXPECT: 400 "No active pricing rule for material UNKNOWN-1"
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR",
+  "items": [ { "material": "UNKNOWN-1", "quantity": 1 } ] }
+
+### F10 Quantity zero
+# EXPECT: 400 "quantity must be greater than 0"
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR",
+  "items": [ { "material": "CAT-1R0719", "quantity": 0 } ] }
+
+### F11 Create an empty quotation
+# EXPECT: 201
+# @name createEmpty
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR" }
+
+###
+@qEmpty = {{createEmpty.response.body.ID}}
+
+### F12 Submit the empty quotation
+# EXPECT: 400 "Add at least one item before submitting"
+POST {{q}}/Quotations({{qEmpty}})/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### F13 Client cannot set calculated fields
+# EXPECT: 201, but status is "Draft" and totalValue is 0 (the values sent are ignored)
+POST {{q}}/Quotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "customerId": "1000001", "validFrom": "2026-10-07", "validTo": "2026-12-31", "currency_code": "INR",
+  "status": "Approved", "totalValue": 999999 }
+
+### F14 Issue a quotation that is not approved
+# EXPECT: 409 "Action not allowed when status is Draft"
+POST {{q}}/Quotations({{qEmpty}})/QuotationService.issue
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### F15 Delete a draft quotation
+# EXPECT: 204
+DELETE {{q}}/Quotations({{qEmpty}})
+Authorization: Basic sales:secret
+
+#####################################################################
+# 9. JOBS
+#####################################################################
+
+### J1 Expire job
+# EXPECT: 200, value like "0 quotation(s) expired"
+POST {{host}}/odata/v4/job/expireQuotations
+Authorization: Basic scheduler:secret
+Content-Type: application/json
+
+{}
+
+### J2 Reminder job
+# EXPECT: 200, value like "N reminder(s) to send"
+POST {{host}}/odata/v4/job/sendReminders
+Authorization: Basic scheduler:secret
+Content-Type: application/json
+
+{}
+
+### J3 Procurement sync job
+# EXPECT: 200, value like "N open procurement item(s) checked"
+POST {{host}}/odata/v4/job/syncProcurement
+Authorization: Basic scheduler:secret
+Content-Type: application/json
+
+{}
+
+### J4 Sales Executive cannot call jobs
+# EXPECT: 403
+POST {{host}}/odata/v4/job/expireQuotations
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+#####################################################################
+# 10. SEEDED SAMPLE DATA (fixed IDs from the CSV files, no setup needed)
+#####################################################################
+
+### S1 List all quotations
+# EXPECT: 200, the 20 seeded ones plus those created above
+GET {{q}}/Quotations?$select=quotationNo,status,customerName,totalValue&$orderby=quotationNo
+Authorization: Basic sales:secret
+
+### S2 Read seeded PendingL1 quotation Q-2026-00007
+# EXPECT: status "PendingL1", 1 item with thresholdBreached true, deviationPct 0.48
+GET {{q}}/Quotations(22222222-0000-0000-0000-000000000007)?$expand=items,approvals
+Authorization: Basic sales:secret
+
+### S3 Manager approves Q-2026-00007
+# EXPECT: status "Approved"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000007)/QuotationService.approve
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "Seeded data test" }
+
+### S4 Manager rejects Q-2026-00008
+# EXPECT: status "Rejected"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000008)/QuotationService.reject
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "Discount too high" }
+
+### S5 Manager cannot act on Q-2026-00009 (waiting for the Regional Head)
+# EXPECT: 403 "Only RegionalHead can act ..."
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000009)/QuotationService.approve
+Authorization: Basic manager:secret
+Content-Type: application/json
+
+{ "comments": "wrong level" }
+
+### S6 Regional Head approves Q-2026-00009
+# EXPECT: status "Approved"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000009)/QuotationService.approve
+Authorization: Basic head:secret
+Content-Type: application/json
+
+{ "comments": "L2 ok" }
+
+### S7 Issue the seeded Approved quotation Q-2026-00010
+# EXPECT: status "Issued"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000010)/QuotationService.issue
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S8 Sales order for the seeded Issued quotation Q-2026-00013
+# EXPECT: status "Converted", s4SalesOrderNo filled
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000013)/QuotationService.createSalesOrder
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S9 Sales order on the seeded Converted quotation Q-2026-00014
+# EXPECT: 409 "Action not allowed when status is Converted"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000014)/QuotationService.createSalesOrder
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S10 Resubmit the seeded Returned quotation Q-2026-00017
+# EXPECT: status "PendingL1"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000017)/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S11 Edit the seeded Expired quotation Q-2026-00018
+# EXPECT: 409 "Quotation cannot be changed when status is Expired"
+PATCH {{q}}/Quotations(22222222-0000-0000-0000-000000000018)
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{ "remarks": "late change" }
+
+### S12 Cancel the seeded Draft quotation Q-2026-00001
+# EXPECT: status "Cancelled"
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000001)/QuotationService.cancel
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S13 Submit the seeded Draft quotation Q-2026-00002
+# EXPECT: status "Approved" (price within threshold)
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000002)/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S14 Submit the seeded AwaitingStock quotation Q-2026-00004
+# EXPECT: 409 "Stock not available for: CAT-740-ADT ..."
+POST {{q}}/Quotations(22222222-0000-0000-0000-000000000004)/QuotationService.submit
+Authorization: Basic sales:secret
+Content-Type: application/json
+
+{}
+
+### S15 Seeded Shipped item (Q-2026-00006): post the goods receipt
+# EXPECT: procurementStatus "GRPosted", stockStatus "InStock"
+POST {{q}}/QuotationItems(33333333-0000-0000-0000-000000000006)/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "GRPosted" }
+
+### S16 Q-2026-00006 after the goods receipt
+# EXPECT: status "Draft"
+GET {{q}}/Quotations(22222222-0000-0000-0000-000000000006)
+Authorization: Basic sales:secret
+
+### S17 Seeded PRCreated item (Q-2026-00004): release the PR
+# EXPECT: procurementStatus "PRReleased"
+POST {{q}}/QuotationItems(33333333-0000-0000-0000-000000000004)/QuotationService.updateProcurement
+Authorization: Basic supply:secret
+Content-Type: application/json
+
+{ "status": "PRReleased" }
+
+### S18 Procurement history for the Q-2026-00006 item
+# EXPECT: 6 events (5 seeded + GRPosted)
+GET {{q}}/ProcurementEvents?$filter=item_ID eq 33333333-0000-0000-0000-000000000006
+Authorization: Basic sales:secret
+
+### S19 Approval history of the seeded Level 2 quotation Q-2026-00012
+# EXPECT: 3 entries: Submitted (0), Approved (1), Approved (2)
+GET {{q}}/ApprovalHistory?$filter=quotation_ID eq 22222222-0000-0000-0000-000000000012
+Authorization: Basic sales:secret
+
+### S20 Customer list
+# EXPECT: 200, 20 customers
+GET {{host}}/odata/v4/masterdata/BusinessPartners
+Authorization: Basic sales:secret

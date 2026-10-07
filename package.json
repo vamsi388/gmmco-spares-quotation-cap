@@ -1,0 +1,34 @@
+{
+  "name": "gmmco-spares-quotation-cap",
+  "version": "1.0.0",
+  "description": "Welcome to your new CAP project.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cap-js/cds-test": "^1"
+  },
+  "dependencies": {
+    "@sap/xssec": "^4"
+  },
+  "cds": {
+    "requires": {
+       "auth": {
+        "kind": "mocked",
+        "users": {
+          "pricing":   { "password": "secret", "roles": ["PricingAdmin"] },
+          "sales":     { "password": "secret", "roles": ["SalesExecutive"] },
+          "manager":   { "password": "secret", "roles": ["SalesManager"] },
+          "head":      { "password": "secret", "roles": ["RegionalHead"] },
+          "supply":    { "password": "secret", "roles": ["SupplyChain"] },
+          "auditor":   { "password": "secret", "roles": ["Auditor"] },
+          "scheduler": { "password": "secret", "roles": ["JobScheduler"] }
+        }
+      }
+    }
+  }
+}

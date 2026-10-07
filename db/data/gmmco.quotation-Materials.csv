@@ -1,0 +1,21 @@
+material,description,uom,materialGroup
+CAT-320-EXC,Cat 320 Hydraulic Excavator,EA,EQUIPMENT
+CAT-D6-DOZ,Cat D6 Track-Type Tractor,EA,EQUIPMENT
+CAT-1R0719,Oil Filter - Engine,EA,PARTS
+CAT-3E2247,Hydraulic Hose Assembly,EA,PARTS
+CAT-9X3263,Fuel Filter,EA,PARTS
+CAT-336-EXC,Cat 336 Hydraulic Excavator,EA,EQUIPMENT
+CAT-950-LDR,Cat 950 Wheel Loader,EA,EQUIPMENT
+CAT-740-ADT,Cat 740 Articulated Truck,EA,EQUIPMENT
+CAT-C15-ENG,Cat C15 Industrial Engine,EA,ENGINE
+CAT-C9-GEN,Cat C9 Generator Set,EA,ENGINE
+CAT-TRK-SHOE,Track Shoe Assembly,EA,UNDERCARRIAGE
+CAT-TRK-ROLL,Track Roller,EA,UNDERCARRIAGE
+CAT-BKT-TEETH,Bucket Tooth Set,SET,GET
+CAT-HYD-PUMP,Hydraulic Pump,EA,HYDRAULICS
+CAT-HYD-CYL,Hydraulic Cylinder,EA,HYDRAULICS
+CAT-AIR-FLT,Air Filter Element,EA,FILTERS
+CAT-COOLANT,Extended Life Coolant 20L,EA,LUBES
+CAT-ENG-OIL,Engine Oil 15W-40 20L,EA,LUBES
+CAT-BRK-PAD,Brake Pad Set,SET,PARTS
+CAT-FAN-BLT,Fan Belt,EA,PARTS
